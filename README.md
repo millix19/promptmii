@@ -2,7 +2,7 @@
 
 **PromptMII** automatically generates task-specific instructions for classification tasks, achieving many-shot in-context learning (ICL) performance while using 3-13× fewer tokens.
 
-[![Paper](https://img.shields.io/badge/Paper-ArXiv-blue)](https://openreview.net/)
+[![Paper](https://img.shields.io/badge/Paper-ArXiv-blue)](https://arxiv.org/abs/2510.16932)
 [![Dataset](https://img.shields.io/badge/🤗%20Dataset-PromptMII-yellow)](https://huggingface.co/datasets/milli19/promptmii-dataset)
 [![Models](https://img.shields.io/badge/🤗%20Models-PromptMII-yellow)](https://huggingface.co/milli19)
 
@@ -98,3 +98,14 @@ sbatch add_api_instruction_baseline_sglang.sh
 Training code is based on [VeRL](https://github.com/volcengine/verl)
 
 ## Citation
+```
+@misc{xiao2025promptmiimetalearninginstructioninduction,
+      title={Prompt-MII: Meta-Learning Instruction Induction for LLMs}, 
+      author={Emily Xiao and Yixiao Zeng and Ada Chen and Chin-Jou Li and Amanda Bertsch and Graham Neubig},
+      year={2025},
+      eprint={2510.16932},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2510.16932}, 
+}
+```
