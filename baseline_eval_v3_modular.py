@@ -427,6 +427,164 @@ class BaselineRunner:
                 "correct": ex["label"].lower().strip() == pred.lower().strip()
             })
         return results
+    
+    def run_GEPA_baseline(self, train_subset: List[Dict], test_subset: List[Dict], 
+                         label_names: List[str], dataset_info: Dict[str, Any], 
+                         requested_n: int, actual_n: int) -> List[Dict]:
+        """
+        Run GEPA baseline: use GEPA to optimize instruction, then classify test set.
+        """
+        import gepa
+        from gepa.core.adapter import EvaluationBatch, GEPAAdapter
+        custom_line = f"Only return one of these options: {', '.join(label_names)}. Do not output \"Label:\" or any extra text.\n\n"
+
+        # Split train_subset into train and val (1:2 ratio)  
+        if len(train_subset) < 2:
+            split_point = 1
+        else:
+            split_point = len(train_subset) // 3
+        gepa_dataset = [{
+                "input": ex["text"],
+                "additional_context": {},
+                "answer": ex["label"]
+            } for ex in train_subset]
+        if len(gepa_dataset) < 2:
+            gepa_trainset = gepa_dataset
+            gepa_valset = None
+        else:
+            gepa_trainset = gepa_dataset[:split_point]
+            gepa_valset = gepa_dataset[split_point:]
+        
+        # Create classification adapter following GEPA's structure
+        class ClassificationAdapter(GEPAAdapter):
+            def __init__(self, prediction_model, prediction_vllm_url, label_names):
+                self.prediction_model = prediction_model
+                self.prediction_vllm_url = prediction_vllm_url
+                self.label_names = label_names
+                self.failure_score = 0.0
+            
+            def evaluate(self, batch, candidate, capture_traces=False):
+                # Get the instruction from candidate (GEPA passes dict with instruction)
+                system_content = list(candidate.values())[0] if candidate else ""
+                
+                # Apply instruction to batch
+                messages_list = []
+                for ex in batch:
+                    user_content = f"Input: {ex['input']}"
+                    messages = [{"role": "user", "content": system_content + custom_line + user_content}]
+                    messages_list.append(messages)
+                
+                predictions = query_local_vllm_chat_batch(
+                    messages_list, 
+                    max_tokens=MAX_TOKENS_PREDICTION, 
+                    temperature=0.0, 
+                    model=self.prediction_model, 
+                    vllm_url=self.prediction_vllm_url
+                )
+                
+                # Calculate scores and outputs
+                outputs = []
+                scores = []
+                trajectories = [] if capture_traces else None
+                
+                for ex, pred in zip(batch, predictions):
+                    score = 1.0 if ex["answer"].lower().strip() == pred.lower().strip() else 0.0
+                    
+                    output = {"full_assistant_response": pred}
+                    outputs.append(output)
+                    scores.append(score)
+                    
+                    if capture_traces:
+                        trajectory = {
+                            "data": ex,
+                            "full_assistant_response": pred
+                        }
+                        trajectories.append(trajectory)
+                
+                return EvaluationBatch(outputs=outputs, scores=scores, trajectories=trajectories)
+            
+            def make_reflective_dataset(self, candidate, eval_batch, components_to_update):
+                """Required method for GEPA adapter"""
+                ret_d = {}
+                comp = components_to_update[0] if components_to_update else "system_prompt"
+                
+                items = []
+                if eval_batch.trajectories:
+                    for traj, score, output in zip(eval_batch.trajectories, eval_batch.scores, eval_batch.outputs):
+                        data = traj["data"]
+                        generated_output = traj["full_assistant_response"]
+                        
+                        if score > 0.0:
+                            feedback = f"The generated response is correct. The response includes the correct answer '{data['answer']}'"
+                        else:
+                            feedback = f"The generated response is incorrect. The correct answer is '{data['answer']}'. Ensure that the correct answer is included in the response exactly as it is."
+                        
+                        item = {
+                            "Inputs": data["input"],
+                            "Generated Outputs": generated_output,
+                            "Feedback": feedback,
+                        }
+                        items.append(item)
+                
+                ret_d[comp] = items
+                return ret_d
+        
+        # Create adapter
+        adapter = ClassificationAdapter(self.prediction_model, self.prediction_vllm_url, label_names)
+        
+        # Start with naive instruction as seed
+        seed_instruction = naive_instruction_prompt(label_names)
+        seed_candidate = {"system_prompt": seed_instruction}
+        
+        print(f"[GEPA] Train set size: {len(gepa_trainset)}")
+        print(f"[GEPA] Val set size: {len(gepa_valset) if gepa_valset else 0}")
+
+        gepa_result = gepa.optimize(
+                    seed_candidate=seed_candidate,
+                    trainset=gepa_trainset,
+                    valset=gepa_valset,
+                    adapter=adapter,
+                    task_lm=None,  
+                    reflection_lm=lambda prompt: query_local_vllm_chat_batch(
+                        [[{"role": "user", "content": prompt}]],
+                        max_tokens=MAX_TOKENS_INSTRUCTION,
+                        temperature=0.0,
+                        model=self.instruction_model,
+                        vllm_url=self.instruction_vllm_url
+                    )[0],
+                    max_metric_calls=150,  
+                    reflection_minibatch_size=min(3, len(gepa_trainset)),  
+                )
+        
+        # Get the optimized instruction
+        optimized_instruction = gepa_result.best_candidate['system_prompt'] + custom_line
+        instruction_tokens = count_tokens_in_instruction(optimized_instruction, self.prediction_model)
+        
+        print(f"[GEPA] Optimization complete. Best score: {max(gepa_result.val_aggregate_scores) if gepa_result.val_aggregate_scores else 'N/A'}")
+        print(f"[GEPA] Optimized instruction:\n{optimized_instruction}\n")
+        
+        # Apply optimized instruction to test set
+        print(f"[INFO] Baseline: GEPA, Instr model: {self.instruction_model}, Prediction model: {self.prediction_model}, n: {actual_n} (requested: {requested_n})")
+        preds = apply_instruction_batch(test_subset, optimized_instruction, self.prediction_model, self.prediction_vllm_url)
+         
+        # Format results
+        results = []
+        for ex_idx, (ex, pred) in enumerate(zip(test_subset, preds)):
+            results.append({
+                **dataset_info,
+                "baseline": "GEPA",
+                "n": requested_n,
+                "actual_n": actual_n,
+                "instruction_model": self.instruction_model,
+                "prediction_model": self.prediction_model,
+                "instruction": optimized_instruction,
+                "instruction_tokens": instruction_tokens,
+                "input": ex["text"],
+                "answer": ex["label"],
+                "prediction": pred,
+                "correct": ex["label"].lower().strip() == pred.lower().strip()
+            })
+        return results
 
 def load_existing_results(output_path: str) -> List[Dict]:
     """Load existing results if they exist."""
@@ -714,6 +872,11 @@ def main():
                         train_subset, test_subset, label_names, dataset_info, requested_n, actual_n, 
                         META_PROMPT_V5, baseline_name
                     )
+                elif baseline == "GEPA":
+                    results = runner.run_GEPA_baseline(
+                        train_subset, test_subset, label_names, dataset_info, requested_n, actual_n
+                    )
+
                 else:
                     print(f"[WARNING] Unknown baseline: {baseline}, skipping...")
                     continue
